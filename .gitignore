@@ -1,0 +1,23 @@
+# Secrets — `.env.example` is checked in, real `.env` never is.
+.env
+
+# Python build / cache artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# uv virtualenv.
+.venv/
+
+# Claude Code: personal/local overrides only. settings.json (shared) is fine to commit.
+.claude/settings.local.json
+
+# Editor / OS detritus.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

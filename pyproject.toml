@@ -1,0 +1,33 @@
+[project]
+name = "jobtrack-agent"
+version = "0.1.0"
+description = "Claude agent that ingests inbound signals and proposes updates to jobtrack via MCP."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "James Noonan" }]
+
+dependencies = [
+    # Agent runtime — manages the tool-use loop and MCP transport.
+    "claude-agent-sdk",
+    # Loads ANTHROPIC_API_KEY from .env during local development.
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+]
+
+[project.scripts]
+jobtrack-agent = "agent.loop:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
