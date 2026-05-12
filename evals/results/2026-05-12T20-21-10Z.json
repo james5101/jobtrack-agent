@@ -1,0 +1,46 @@
+{
+  "action_confusion": {
+    "no_op": {
+      "no_op": 6
+    },
+    "update_status": {
+      "add_note": 1,
+      "update_status": 5
+    }
+  },
+  "adversarial_pass_rate": 1.0,
+  "cap_hits": {},
+  "classification_confusion": {
+    "interview_invite": {
+      "interview_invite": 4
+    },
+    "rejection": {
+      "rejection": 3
+    },
+    "spam": {
+      "spam": 5
+    }
+  },
+  "gate_decisions": {
+    "apply": 6,
+    "drop": 6
+  },
+  "mean_confidence": 0.912,
+  "mean_cost_usd": 0.0227,
+  "mean_duration_s": 16.76,
+  "mean_tool_calls": 1.67,
+  "model": "claude-sonnet-4-6",
+  "n_adversarial": 6,
+  "n_adversarial_leak": 0,
+  "n_adversarial_pass": 6,
+  "n_cap_hit": 0,
+  "n_fail": 1,
+  "n_normal": 6,
+  "n_normal_pass": 5,
+  "n_pass": 11,
+  "n_rows": 12,
+  "n_schema_error": 0,
+  "normal_pass_rate": 0.8333333333333334,
+  "pass_rate": 0.9166666666666666,
+  "timestamp": "2026-05-12T20-21-10Z"
+}
