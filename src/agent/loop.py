@@ -1,24 +1,35 @@
-"""Phase 1 agent loop — single-shot email triage.
+"""Phase 3.2 agent loop — single-shot email triage with structured output.
 
 Reads one email from stdin (or argv[1] as a file path), runs a Claude agent
-that talks to jobtrack via MCP, and prints a proposed action as JSON.
+that talks to jobtrack via MCP, and prints a *validated* JSON proposal.
 
-The tool-call trace and run metadata go to stderr so the JSON on stdout can be
-piped cleanly:
+Structural change vs Phase 1: the agent's final message is now constrained
+to match a JSON Schema generated from `AgentProposal` (see `models.py`).
+The CLI's `--json-schema` flag triggers Anthropic's constrained sampling,
+which retries internally on validation failure and ultimately reports
+`error_max_structured_output_retries` if it can't comply. Tool use during
+the loop remains free-form.
+
+What this earns:
+- "Wrong arg key" (id vs application_id) becomes a validation error
+  instead of a silently-broken proposal.
+- Confidence is a typed float, ready for Phase 3.3 gating thresholds.
+- Markdown fences and prose around the JSON are impossible — no more
+  tolerant text parsing.
+
+Phase 1's read-only constraint is preserved: the agent's tool surface is
+restricted to the four jobtrack read tools. Write tools come back behind
+the confidence gate in Phase 3.3.
+
+Tool-call trace + run metadata go to stderr so the proposal JSON on stdout
+pipes cleanly:
 
     python -m agent.loop samples/emails/interview-01.eml > proposal.json
-
-Phase 1 is read-only by construction: the agent's tool surface is restricted
-to the four jobtrack read tools. Write tools (update_status, add_note,
-edit_tags) are not callable from this loop. Phase 3 lifts that restriction
-behind a confidence gate and audit log.
-
-The eval harness (`evals/run.py`) imports `run_agent` directly to reuse the
-exact same configuration the CLI uses.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -33,8 +44,10 @@ from claude_agent_sdk import (
     query,
 )
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from .mcp_client import JOBTRACK_SERVER_NAME, jobtrack_mcp_config
+from .models import AgentProposal
 from .sanitize import sanitize_email
 
 _READ_ONLY_TOOLS = [
@@ -42,6 +55,16 @@ _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__get_application",
     f"mcp__{JOBTRACK_SERVER_NAME}__search_applications",
     f"mcp__{JOBTRACK_SERVER_NAME}__get_recent",
+]
+# Explicit denylist for jobtrack write tools. Observed in Phase 3.2 smoke:
+# structured-output mode shifts the model's frame toward "do X, then report",
+# and it begins reaching for write tools even though the system prompt forbids
+# them. allowed_tools blocks execution; `disallowed_tools` blocks attempts
+# entirely so we don't waste turns on rejected calls.
+_WRITE_TOOLS = [
+    f"mcp__{JOBTRACK_SERVER_NAME}__update_status",
+    f"mcp__{JOBTRACK_SERVER_NAME}__add_note",
+    f"mcp__{JOBTRACK_SERVER_NAME}__edit_tags",
 ]
 
 MODEL = "claude-sonnet-4-6"
@@ -68,29 +91,29 @@ the application this email is about. Prefer the company name as your first \
 search term.
 3. If multiple candidates match, use get_application to inspect each and pick \
 the one whose role/timing best fits the email.
-4. Decide on ONE proposed action.
+4. Decide on ONE action.
 
-ALLOWED ACTIONS (proposal only — you cannot and must not execute writes)
+ALLOWED ACTIONS (proposal only)
+You PROPOSE one of these via the structured output. You DO NOT execute it. \
+The jobtrack write tools (update_status, add_note, edit_tags) are blocked at \
+the SDK layer — calling them wastes a turn and accomplishes nothing. Your \
+only output is the final AgentProposal.
 - update_status: the email clearly indicates a state change. Valid statuses: \
 applied, screening, interviewing, offer, rejected, ghosted, withdrawn.
 - add_note: the email contains useful context for an existing application but \
-no clear state change (e.g. a recruiter follow-up with logistics).
+no clear state change.
 - no_op: no matching application, the email is spam/marketing/unrelated, or \
 you're unsure. Always prefer no_op over a low-confidence write.
 
-OUTPUT
-Reply with exactly one JSON object and nothing else — no prose before or after:
+CONFIDENCE (float, 0.0 to 1.0)
+- 0.9+  the email is unambiguous AND the application match is exact.
+- ~0.7  the action is right but there is some real uncertainty (e.g. role \
+title doesn't quite match, the email is a forwarded thread).
+- ~0.5  the action is plausible but the email is genuinely ambiguous.
+- <0.4  you would honestly prefer no_op; use it.
 
-{
-  "classification": "interview_invite | rejection | recruiter_outreach | status_request | offer | other | spam",
-  "matched_application_id": "<id or null>",
-  "proposed_action": {
-    "tool": "update_status | add_note | no_op",
-    "args": { ... arguments matching the tool, or {} for no_op ... }
-  },
-  "confidence": "high | mid | low",
-  "reasoning": "<one or two sentences explaining the call>"
-}
+Confidence is what downstream gating keys on. Inflated confidence costs more \
+than missed matches.
 """
 
 
@@ -98,36 +121,39 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
     """Run one email through the agent and return a structured result.
 
     Returns a dict with:
-        text:        final assistant text (the JSON proposal, possibly with
-                     surrounding prose — parsing is the caller's job).
-        tool_calls:  list of {name, input} dicts in the order they were made.
-        cost_usd:    total cost reported by the SDK, or None.
-        duration_s:  wall-clock seconds.
-
-    When trace=True, tool calls are also echoed to stderr live, mirroring the
-    CLI experience. Eval runs can leave this on for debugging.
+        proposal:           validated AgentProposal | None
+        validation_error:   str | None (set when Pydantic rejects the SDK's output)
+        result_subtype:     str | None (SDK-level subtype, e.g. error_max_structured_output_retries)
+        raw_text:           assistant final text (mostly empty in structured mode)
+        structured_output:  dict | None (what the SDK returned, pre-Pydantic)
+        tool_calls:         list of {name, input}
+        cost_usd:           float | None
+        duration_s:         float
     """
+    schema = AgentProposal.model_json_schema()
+
     options = ClaudeAgentOptions(
         model=MODEL,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={JOBTRACK_SERVER_NAME: jobtrack_mcp_config()},
-        # `tools` defines the universe of tools the model can see — without it
-        # the SDK injects the full Claude Code toolbelt (Read/Bash/ToolSearch/…).
-        # `allowed_tools` pre-approves those tools so they run without a
-        # permission prompt. Both must list the read tools or the agent either
-        # sees extras (the former) or can plan but not act (the latter).
+        # See loop.py module docstring on why both `tools` and `allowed_tools`.
         tools=_READ_ONLY_TOOLS,
         allowed_tools=_READ_ONLY_TOOLS,
+        disallowed_tools=_WRITE_TOOLS,
         max_turns=10,
+        # Phase 3.2 guardrail: constrain the final message to the AgentProposal
+        # schema. The CLI passes this to Anthropic's constrained sampling.
+        output_format={"type": "json_schema", "schema": schema},
     )
 
-    # Phase 3.1 guardrail: strip HTML / quoted replies, cap length,
-    # normalize whitespace. Pure & deterministic — see src/agent/sanitize.py.
     cleaned = sanitize_email(email_text)
     user_message = f"<inbound_email>\n{cleaned}\n</inbound_email>"
+
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     cost_usd: float | None = None
+    structured_output: dict | None = None
+    result_subtype: str | None = None
     start = time.monotonic()
 
     async for message in query(prompt=user_message, options=options):
@@ -141,15 +167,31 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
                 elif isinstance(block, TextBlock):
                     text_parts.append(block.text)
         elif isinstance(message, ResultMessage):
-            if getattr(message, "subtype", None) == "success":
+            result_subtype = getattr(message, "subtype", None)
+            if result_subtype == "success":
                 cost_usd = getattr(message, "total_cost_usd", None)
+                structured_output = getattr(message, "structured_output", None)
 
     duration_s = time.monotonic() - start
+
+    proposal: AgentProposal | None = None
+    validation_error: str | None = None
+    if structured_output is not None:
+        try:
+            proposal = AgentProposal.model_validate(structured_output)
+        except ValidationError as e:
+            validation_error = str(e)
+
     if trace:
-        print(f"[done] cost={cost_usd} duration={duration_s:.2f}s", file=sys.stderr)
+        status = "ok" if proposal is not None else f"FAIL({result_subtype or 'validation_error'})"
+        print(f"[done] cost={cost_usd} duration={duration_s:.2f}s status={status}", file=sys.stderr)
 
     return {
-        "text": "".join(text_parts).strip(),
+        "proposal": proposal,
+        "validation_error": validation_error,
+        "result_subtype": result_subtype,
+        "raw_text": "".join(text_parts).strip(),
+        "structured_output": structured_output,
         "tool_calls": tool_calls,
         "cost_usd": cost_usd,
         "duration_s": duration_s,
@@ -158,9 +200,6 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
 
 def main() -> None:
     load_dotenv()
-    # Windows default stdout encoding (cp1252) chokes on non-ASCII glyphs the
-    # model emits in reasoning fields. Force UTF-8 so a successful agent run
-    # is never lost to a print-time encoding error.
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
@@ -174,7 +213,20 @@ def main() -> None:
         sys.exit(2)
 
     result = asyncio.run(run_agent(email_text))
-    print(result["text"])
+
+    if result["proposal"] is not None:
+        print(json.dumps(result["proposal"].model_dump(mode="json"), indent=2))
+    else:
+        print(json.dumps(
+            {
+                "error": "no_validated_proposal",
+                "result_subtype": result["result_subtype"],
+                "validation_error": result["validation_error"],
+                "raw_structured_output": result["structured_output"],
+            },
+            indent=2,
+        ))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

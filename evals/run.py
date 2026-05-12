@@ -1,27 +1,20 @@
-"""Phase 2 eval harness.
+"""Phase 2 eval harness — Phase 3.2 update for structured output.
 
-Loads the labeled dataset, runs the agent against each row, parses the agent's
-JSON output, and produces a scorecard. Committed snapshots in `results/` are
-the diff-able history that gates every prompt change from here on.
-
-Usage:
-    uv run evals
-    # or
-    uv run python -m evals.run
+Loads the labeled dataset, runs the agent against each row, reads the
+validated `AgentProposal` from the SDK, and produces a scorecard.
 
 Reads:
-    evals/dataset.jsonl                 # sanitized, committed
-    evals/dataset-real.jsonl (optional) # unsanitized, gitignored
+    evals/dataset.jsonl                 (sanitized, committed)
+    evals/dataset-real.jsonl (optional) (unsanitized, gitignored)
 
 Writes:
-    evals/results/<UTC-timestamp>.json       # aggregate scorecard
-    evals/results/<UTC-timestamp>.rows.jsonl # per-row detail
+    evals/results/<UTC-timestamp>.json       (aggregate scorecard)
+    evals/results/<UTC-timestamp>.rows.jsonl (per-row detail, gitignored)
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,6 +24,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from agent.loop import MODEL, run_agent
+from agent.models import ActionTool, AgentProposal
 
 EVALS_DIR = Path(__file__).resolve().parent
 DATASET_FILES = ["dataset.jsonl", "dataset-real.jsonl"]
@@ -40,7 +34,6 @@ RESULTS_DIR = EVALS_DIR / "results"
 # ---------- Dataset loading ----------
 
 def load_dataset() -> list[dict]:
-    """Concatenate every dataset file that exists. Each JSONL line is one row."""
     rows: list[dict] = []
     for name in DATASET_FILES:
         path = EVALS_DIR / name
@@ -54,60 +47,24 @@ def load_dataset() -> list[dict]:
     return rows
 
 
-# ---------- Output parsing ----------
-
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def parse_agent_json(text: str) -> dict | None:
-    """Extract the first JSON object from agent output.
-
-    Tolerates two known failure modes from Phase 1:
-    - markdown fences (```json ... ```) wrapping the JSON
-    - prose before / after the JSON block
-
-    Strategy: try the contents of the first ``` block, then fall back to
-    scanning for the first balanced JSON object in the raw text. Returns
-    None if nothing parses — the caller records that as a parse_error row.
-    """
-    candidates: list[str] = []
-    m = _FENCE_RE.search(text)
-    if m:
-        candidates.append(m.group(1))
-    candidates.append(text)
-
-    decoder = json.JSONDecoder()
-    for candidate in candidates:
-        idx = candidate.find("{")
-        while idx != -1:
-            try:
-                obj, _end = decoder.raw_decode(candidate, idx)
-                if isinstance(obj, dict):
-                    return obj
-            except json.JSONDecodeError:
-                pass
-            idx = candidate.find("{", idx + 1)
-    return None
-
-
 # ---------- Per-row scoring ----------
 
-def evaluate_row(row: dict, actual: dict | None) -> dict:
-    """Compare agent output (actual) against labeled expectations (row).
+def evaluate_row(row: dict, proposal: AgentProposal | None) -> dict:
+    """Compare the agent's validated proposal against labeled expectations.
 
     A row passes when:
     - classification matches
-    - proposed_action.tool matches
+    - action.tool matches
     - matched_application_id matches (or both null)
-    - when the action is update_status, the status arg also matches
+    - for update_status: action.status also matches
 
-    Each component is tracked separately so the scorecard can attribute
-    failures to a specific dimension, not just total pass/fail.
+    When the proposal is None (SDK couldn't produce schema-valid output OR
+    Pydantic rejected it), we record `schema_error` separately from `fail`.
     """
-    if actual is None:
+    if proposal is None:
         return {
             "pass": False,
-            "parse_error": True,
+            "schema_error": True,
             "classification_match": False,
             "tool_match": False,
             "app_id_match": False,
@@ -115,25 +72,22 @@ def evaluate_row(row: dict, actual: dict | None) -> dict:
         }
 
     expected_classification = row["expected_classification"]
-    actual_classification = actual.get("classification")
-    classification_match = actual_classification == expected_classification
+    classification_match = proposal.classification.value == expected_classification
 
     expected_action = row["expected_action"]
     expected_tool = expected_action["tool"]
-    actual_action = actual.get("proposed_action") or {}
-    actual_tool = actual_action.get("tool")
-    tool_match = actual_tool == expected_tool
+    tool_match = proposal.tool.value == expected_tool
 
     expected_app = row.get("expected_app_id_or_null")
-    actual_app = actual.get("matched_application_id")
-    app_id_match = actual_app == expected_app
+    app_id_match = proposal.matched_application_id == expected_app
 
     status_match: bool | None = None
     if expected_tool == "update_status":
         expected_status = expected_action.get("status")
-        actual_args = actual_action.get("args") or {}
-        actual_status = actual_args.get("status")
-        status_match = actual_status == expected_status
+        if proposal.tool is ActionTool.UPDATE_STATUS and proposal.status is not None:
+            status_match = proposal.status.value == expected_status
+        else:
+            status_match = False
 
     passed = classification_match and tool_match and app_id_match
     if expected_tool == "update_status":
@@ -141,7 +95,7 @@ def evaluate_row(row: dict, actual: dict | None) -> dict:
 
     return {
         "pass": bool(passed),
-        "parse_error": False,
+        "schema_error": False,
         "classification_match": classification_match,
         "tool_match": tool_match,
         "app_id_match": app_id_match,
@@ -156,35 +110,44 @@ def aggregate(per_row: list[dict]) -> dict:
     if n == 0:
         return {"n_rows": 0}
 
-    n_parse = sum(1 for r in per_row if r["evaluation"]["parse_error"])
+    n_schema_err = sum(1 for r in per_row if r["evaluation"]["schema_error"])
     n_pass = sum(1 for r in per_row if r["evaluation"]["pass"])
-    n_fail = n - n_pass - n_parse
+    n_fail = n - n_pass - n_schema_err
 
     class_confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     action_confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for r in per_row:
         e = r["expected"]
-        a = r.get("actual") or {}
-        class_confusion[e["expected_classification"]][a.get("classification") or "<parse_err>"] += 1
-        action_confusion[e["expected_action"]["tool"]][(a.get("proposed_action") or {}).get("tool") or "<parse_err>"] += 1
+        a = r.get("proposal") or {}
+        actual_class = a.get("classification") if a else "<schema_err>"
+        actual_tool = a.get("tool") if a else "<schema_err>"
+        class_confusion[e["expected_classification"]][actual_class or "<schema_err>"] += 1
+        action_confusion[e["expected_action"]["tool"]][actual_tool or "<schema_err>"] += 1
 
-    valid = [r for r in per_row if not r["evaluation"]["parse_error"]]
+    valid = [r for r in per_row if not r["evaluation"]["schema_error"]]
     n_valid = max(len(valid), 1)
     mean_tool_calls = sum(len(r["tool_calls"]) for r in valid) / n_valid
     mean_cost = sum((r["cost_usd"] or 0) for r in valid) / n_valid
     mean_duration = sum(r["duration_s"] for r in valid) / n_valid
 
+    confidences = [
+        (r["proposal"] or {}).get("confidence") for r in per_row
+        if r["proposal"] and (r["proposal"] or {}).get("confidence") is not None
+    ]
+    mean_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
+
     return {
         "n_rows": n,
         "n_pass": n_pass,
         "n_fail": n_fail,
-        "n_parse_error": n_parse,
+        "n_schema_error": n_schema_err,
         "pass_rate": n_pass / n,
         "classification_confusion": {k: dict(v) for k, v in class_confusion.items()},
         "action_confusion": {k: dict(v) for k, v in action_confusion.items()},
         "mean_tool_calls": round(mean_tool_calls, 2),
         "mean_cost_usd": round(mean_cost, 4),
         "mean_duration_s": round(mean_duration, 2),
+        "mean_confidence": mean_conf,
     }
 
 
@@ -193,8 +156,8 @@ def aggregate(per_row: list[dict]) -> dict:
 async def run_row(row: dict) -> dict:
     print(f"\n=== {row['id']} ===", file=sys.stderr)
     result = await run_agent(row["email_body"])
-    actual = parse_agent_json(result["text"])
-    evaluation = evaluate_row(row, actual)
+    proposal_obj: AgentProposal | None = result["proposal"]
+    evaluation = evaluate_row(row, proposal_obj)
 
     return {
         "id": row["id"],
@@ -203,8 +166,10 @@ async def run_row(row: dict) -> dict:
             "expected_action": row["expected_action"],
             "expected_app_id_or_null": row.get("expected_app_id_or_null"),
         },
-        "actual": actual,
-        "raw_output": result["text"],
+        "proposal": proposal_obj.model_dump(mode="json") if proposal_obj else None,
+        "validation_error": result["validation_error"],
+        "result_subtype": result["result_subtype"],
+        "raw_structured_output": result["structured_output"],
         "tool_calls": result["tool_calls"],
         "cost_usd": result["cost_usd"],
         "duration_s": result["duration_s"],
@@ -230,10 +195,10 @@ async def run_all() -> tuple[dict, list[dict]]:
 
 # ---------- Scorecard printing ----------
 
-def _mark(ok: bool | None) -> str:
+def _flag(ok: bool | None) -> str:
     if ok is None:
-        return "  "
-    return "  " if ok else "X "
+        return "-"
+    return "ok" if ok else "X"
 
 
 def print_scorecard(score: dict, results: list[dict]) -> None:
@@ -241,34 +206,40 @@ def print_scorecard(score: dict, results: list[dict]) -> None:
     print("=" * 64)
     print("SCORECARD")
     print("=" * 64)
-    print(f"Rows:        {score['n_rows']}")
-    print(f"Passed:      {score['n_pass']} ({score['pass_rate']:.0%})")
-    print(f"Failed:      {score['n_fail']}")
-    print(f"Parse error: {score['n_parse_error']}")
+    print(f"Rows:         {score['n_rows']}")
+    print(f"Passed:       {score['n_pass']} ({score['pass_rate']:.0%})")
+    print(f"Failed:       {score['n_fail']}")
+    print(f"Schema error: {score['n_schema_error']}")
     print()
     print(f"Mean tool calls/row: {score['mean_tool_calls']}")
     print(f"Mean cost/row:       ${score['mean_cost_usd']}")
     print(f"Mean duration/row:   {score['mean_duration_s']}s")
+    print(f"Mean confidence:     {score['mean_confidence']}")
     print()
-    print("Per-row results:")
+    print("Per-row:")
     for r in results:
         e = r["evaluation"]
-        flag = "PASS" if e["pass"] else ("PARSE_ERR" if e["parse_error"] else "FAIL")
-        print(f"  [{flag:9s}] {r['id']:30s} "
-              f"cls={_mark(e['classification_match']).strip() or 'ok'} "
-              f"tool={_mark(e['tool_match']).strip() or 'ok'} "
-              f"app={_mark(e['app_id_match']).strip() or 'ok'} "
-              f"status={'ok' if e['status_match'] is True else ('x' if e['status_match'] is False else '-')}")
+        flag = "PASS" if e["pass"] else ("SCHEMA_ERR" if e["schema_error"] else "FAIL")
+        conf = (r["proposal"] or {}).get("confidence")
+        conf_str = f"conf={conf:.2f}" if isinstance(conf, (int, float)) else "conf=  - "
+        print(f"  [{flag:10s}] {r['id']:30s} "
+              f"{conf_str}  "
+              f"cls={_flag(e['classification_match'])} "
+              f"tool={_flag(e['tool_match'])} "
+              f"app={_flag(e['app_id_match'])} "
+              f"status={_flag(e['status_match'])}")
     print()
     print("Classification confusion (expected -> actual):")
     for exp, actuals in score["classification_confusion"].items():
         for act, count in actuals.items():
-            print(f"  {_mark(exp == act)}{exp:22s} -> {act:22s} {count}")
+            mark = "  " if exp == act else "X "
+            print(f"  {mark}{exp:22s} -> {act:22s} {count}")
     print()
     print("Action confusion (expected -> actual):")
     for exp, actuals in score["action_confusion"].items():
         for act, count in actuals.items():
-            print(f"  {_mark(exp == act)}{exp:15s} -> {act:15s} {count}")
+            mark = "  " if exp == act else "X "
+            print(f"  {mark}{exp:15s} -> {act:15s} {count}")
     print()
 
 
