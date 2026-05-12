@@ -27,6 +27,22 @@ Each line in the dataset files is one JSON object:
 }
 ```
 
+## Adding rows
+
+Either hand-edit the JSONL or use the helper:
+
+```bash
+uv run python -m evals.add_row \
+    --eml samples/emails/rejection-acme-real.eml \
+    --id rejection-acme-real \
+    --classification rejection \
+    --tool update_status --status rejected \
+    --app-id 2026-05-12_acme_engineer_abcd \
+    --notes "form rejection; app exists in jobtrack"
+```
+
+The script picks the right dataset file from the `.eml` filename (`*-real.eml` → `dataset-real.jsonl`, else `dataset.jsonl`) and validates the labels against the closed enums. There's also a Claude skill (`.claude/skills/add-eval-row/`) that walks you through the labeling decisions interactively.
+
 ## Running
 
 ```bash
