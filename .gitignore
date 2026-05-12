@@ -15,6 +15,10 @@ build/
 # Claude Code: personal/local overrides only. settings.json (shared) is fine to commit.
 .claude/settings.local.json
 
+# Real, unsanitized email samples live locally only. Sanitized versions
+# (without `-real` in the filename) are fair game to commit.
+samples/emails/*-real.eml
+
 # Editor / OS detritus.
 .vscode/
 .idea/
