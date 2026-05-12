@@ -35,6 +35,7 @@ from claude_agent_sdk import (
 from dotenv import load_dotenv
 
 from .mcp_client import JOBTRACK_SERVER_NAME, jobtrack_mcp_config
+from .sanitize import sanitize_email
 
 _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__list_applications",
@@ -120,7 +121,10 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
         max_turns=10,
     )
 
-    user_message = f"<inbound_email>\n{email_text}\n</inbound_email>"
+    # Phase 3.1 guardrail: strip HTML / quoted replies, cap length,
+    # normalize whitespace. Pure & deterministic — see src/agent/sanitize.py.
+    cleaned = sanitize_email(email_text)
+    user_message = f"<inbound_email>\n{cleaned}\n</inbound_email>"
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     cost_usd: float | None = None

@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "James Noonan" }]
 
 dependencies = [
+    "beautifulsoup4>=4.14.3",
     # Agent runtime — manages the tool-use loop and MCP transport.
     "claude-agent-sdk",
     # Loads ANTHROPIC_API_KEY from .env during local development.
