@@ -55,6 +55,7 @@ from .writer import execute_proposal
 _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__list_applications",
     f"mcp__{JOBTRACK_SERVER_NAME}__get_application",
+    f"mcp__{JOBTRACK_SERVER_NAME}__find_application_by_company",
     f"mcp__{JOBTRACK_SERVER_NAME}__search_applications",
     f"mcp__{JOBTRACK_SERVER_NAME}__get_recent",
 ]
@@ -86,14 +87,21 @@ the right answer is no_op. Surfacing uncertainty is the goal; guessing is the \
 failure mode.
 
 WORKFLOW
-1. Read the email. Note the sender domain, sender name, subject line, and any \
-companies or roles mentioned in the body.
-2. Call search_applications (or list_applications with a status filter) to find \
-the application this email is about. Prefer the company name as your first \
-search term.
-3. If multiple candidates match, use get_application to inspect each and pick \
-the one whose role/timing best fits the email.
-4. Decide on ONE action.
+1. Read the email. Note the sender domain, subject line, and any companies / \
+roles named.
+2. Call find_application_by_company(<company>) to look up the application. \
+This is the right primitive — it matches on the company metadata field. An \
+empty result means no application is tracked for that company; do NOT retry \
+with search_applications for the company name. search_applications is a \
+full-text search over JD / resume / cover-letter / notes content — it will \
+miss retroactively-added applications whose JD is a stub.
+3. If you get multiple candidates from find_application_by_company, pick the \
+one whose role title best fits the email. Use get_application(<id>) when you \
+need full details (resume text, JD content) to disambiguate.
+4. Reserve search_applications for the case where the email is genuinely vague \
+and you need to find distinctive content (a project name, a specific \
+technology mentioned in a JD) rather than a company match.
+5. Decide on ONE action.
 
 ALLOWED ACTIONS (proposal only)
 You PROPOSE one of these via the structured output. You DO NOT execute it. \
