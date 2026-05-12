@@ -1,0 +1,29 @@
+{
+  "action_confusion": {
+    "no_op": {
+      "no_op": 1
+    },
+    "update_status": {
+      "no_op": 1,
+      "update_status": 4
+    }
+  },
+  "classification_confusion": {
+    "interview_invite": {
+      "interview_invite": 3
+    },
+    "rejection": {
+      "rejection": 3
+    }
+  },
+  "mean_cost_usd": 0.0171,
+  "mean_duration_s": 14.27,
+  "mean_tool_calls": 2.0,
+  "model": "claude-sonnet-4-6",
+  "n_fail": 2,
+  "n_parse_error": 0,
+  "n_pass": 4,
+  "n_rows": 6,
+  "pass_rate": 0.6666666666666666,
+  "timestamp": "2026-05-12T14-36-53Z"
+}
