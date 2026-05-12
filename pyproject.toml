@@ -12,6 +12,7 @@ dependencies = [
     # Agent runtime — manages the tool-use loop and MCP transport.
     "claude-agent-sdk",
     # Loads ANTHROPIC_API_KEY from .env during local development.
+    "fastmcp>=3.2.4",
     "pydantic>=2.13.4",
     "python-dotenv>=1.0",
 ]

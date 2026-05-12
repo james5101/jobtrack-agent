@@ -27,6 +27,10 @@ evals/dataset-real.jsonl
 # files in evals/results/ commit. The `.rows.jsonl` companions stay local.
 evals/results/*.rows.jsonl
 
+# Phase 3.3 queued proposals contain the email hash and full proposal data,
+# including real recruiter / application identifiers. Stay local.
+pending_actions/
+
 # Editor / OS detritus.
 .vscode/
 .idea/

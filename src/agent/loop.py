@@ -46,9 +46,11 @@ from claude_agent_sdk import (
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
+from .gating import GateDecision, gate_proposal
 from .mcp_client import JOBTRACK_SERVER_NAME, jobtrack_mcp_config
 from .models import AgentProposal
 from .sanitize import sanitize_email
+from .writer import execute_proposal
 
 _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__list_applications",
@@ -198,13 +200,50 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
     }
 
 
+async def triage(email_text: str, *, execute: bool = True) -> dict[str, Any]:
+    """Full pipeline: agent → gate → (optionally) execute.
+
+    `execute=False` is the eval-safe path: the gate decision is computed
+    but the writer is not invoked. `execute=True` is production behavior:
+    high-confidence proposals get applied via direct MCP, medium ones get
+    queued, low ones drop.
+    """
+    result = await run_agent(email_text)
+    proposal = result["proposal"]
+    if proposal is None:
+        return {**result, "decision": None, "execution": None}
+
+    decision = gate_proposal(proposal)
+    print(f"[gate] decision={decision.value} confidence={proposal.confidence:.2f}",
+          file=sys.stderr)
+
+    execution: dict[str, Any] | None = None
+    if execute:
+        execution = await execute_proposal(proposal, decision, email_body=email_text)
+        print(f"[execute] {execution.get('decision')} executed={execution.get('executed')}",
+              file=sys.stderr)
+
+    return {**result, "decision": decision, "execution": execution}
+
+
 def main() -> None:
     load_dotenv()
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-    if len(sys.argv) > 1:
-        email_text = Path(sys.argv[1]).read_text(encoding="utf-8")
+    # `--dry-run` (or `-n`) suppresses the writer. The agent still runs and
+    # the gate still decides; we just don't call jobtrack or write a queue
+    # file. Useful for testing prompts against a live jobtrack store
+    # without mutating state.
+    args = list(sys.argv[1:])
+    execute = True
+    for flag in ("--dry-run", "-n"):
+        if flag in args:
+            args.remove(flag)
+            execute = False
+
+    if args:
+        email_text = Path(args[0]).read_text(encoding="utf-8")
     else:
         email_text = sys.stdin.read()
 
@@ -212,10 +251,15 @@ def main() -> None:
         print("error: no email provided on stdin or argv[1]", file=sys.stderr)
         sys.exit(2)
 
-    result = asyncio.run(run_agent(email_text))
+    result = asyncio.run(triage(email_text, execute=execute))
 
     if result["proposal"] is not None:
-        print(json.dumps(result["proposal"].model_dump(mode="json"), indent=2))
+        payload = {
+            "proposal": result["proposal"].model_dump(mode="json"),
+            "decision": result["decision"].value if result["decision"] else None,
+            "execution": result["execution"],
+        }
+        print(json.dumps(payload, indent=2, default=str))
     else:
         print(json.dumps(
             {

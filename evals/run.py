@@ -23,6 +23,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from agent.gating import GateDecision, gate_proposal
 from agent.loop import MODEL, run_agent
 from agent.models import ActionTool, AgentProposal
 
@@ -136,6 +137,11 @@ def aggregate(per_row: list[dict]) -> dict:
     ]
     mean_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
 
+    # Phase 3.3: gate decision distribution. What would the agent have done?
+    gate_counts: dict[str, int] = defaultdict(int)
+    for r in per_row:
+        gate_counts[r.get("gate_decision") or "no_proposal"] += 1
+
     return {
         "n_rows": n,
         "n_pass": n_pass,
@@ -144,6 +150,7 @@ def aggregate(per_row: list[dict]) -> dict:
         "pass_rate": n_pass / n,
         "classification_confusion": {k: dict(v) for k, v in class_confusion.items()},
         "action_confusion": {k: dict(v) for k, v in action_confusion.items()},
+        "gate_decisions": dict(gate_counts),
         "mean_tool_calls": round(mean_tool_calls, 2),
         "mean_cost_usd": round(mean_cost, 4),
         "mean_duration_s": round(mean_duration, 2),
@@ -159,6 +166,12 @@ async def run_row(row: dict) -> dict:
     proposal_obj: AgentProposal | None = result["proposal"]
     evaluation = evaluate_row(row, proposal_obj)
 
+    # Phase 3.3: compute the gate decision WITHOUT executing the writer.
+    # Eval runs must never mutate jobtrack state — the decision is a report.
+    gate_decision: GateDecision | None = (
+        gate_proposal(proposal_obj) if proposal_obj is not None else None
+    )
+
     return {
         "id": row["id"],
         "expected": {
@@ -167,6 +180,7 @@ async def run_row(row: dict) -> dict:
             "expected_app_id_or_null": row.get("expected_app_id_or_null"),
         },
         "proposal": proposal_obj.model_dump(mode="json") if proposal_obj else None,
+        "gate_decision": gate_decision.value if gate_decision else None,
         "validation_error": result["validation_error"],
         "result_subtype": result["result_subtype"],
         "raw_structured_output": result["structured_output"],
@@ -222,12 +236,15 @@ def print_scorecard(score: dict, results: list[dict]) -> None:
         flag = "PASS" if e["pass"] else ("SCHEMA_ERR" if e["schema_error"] else "FAIL")
         conf = (r["proposal"] or {}).get("confidence")
         conf_str = f"conf={conf:.2f}" if isinstance(conf, (int, float)) else "conf=  - "
+        gate = (r.get("gate_decision") or "-").upper()[:5]
         print(f"  [{flag:10s}] {r['id']:30s} "
-              f"{conf_str}  "
+              f"{conf_str} gate={gate:5s}  "
               f"cls={_flag(e['classification_match'])} "
               f"tool={_flag(e['tool_match'])} "
               f"app={_flag(e['app_id_match'])} "
               f"status={_flag(e['status_match'])}")
+    print()
+    print(f"Gate decisions: {score['gate_decisions']}")
     print()
     print("Classification confusion (expected -> actual):")
     for exp, actuals in score["classification_confusion"].items():
