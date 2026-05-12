@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,38 @@ _WRITE_TOOLS = [
 ]
 
 MODEL = "claude-sonnet-4-6"
+
+# Phase 3.4 cost limits. Env-driven so production (systemd, container) can
+# tune without code changes. Defaults are calibrated against current eval
+# data — typical row spends ~$0.02 in ~2 tool calls in ~18s; caps allow
+# ~10x headroom and fail closed past that. When any cap fires we return a
+# no-proposal result; the eval harness scores it under cap_hit (not
+# pass/fail) and downstream gating naturally drops it.
+MAX_BUDGET_USD = float(os.environ.get("AGENT_MAX_BUDGET_USD", "0.20"))
+MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "10"))
+WALL_CLOCK_TIMEOUT_S = float(os.environ.get("AGENT_WALL_CLOCK_TIMEOUT_S", "60"))
+
+
+def _classify_runtime_exception(exc: BaseException) -> tuple[str | None, str]:
+    """Map an SDK runtime exception to (cap_hit, result_subtype).
+
+    The SDK raises a plain `Exception` for cap-related failures rather than
+    emitting a ResultMessage with a recognizable subtype (smoke-tested
+    2026-05-12 with max_turns=1). We pattern-match the error message string
+    to map it back to a meaningful cap_hit kind.
+
+    Returns:
+        (cap_hit, result_subtype):
+            cap_hit       — "turns" | "budget" | None
+            result_subtype — short string for display ("max_turns", "max_budget",
+                             or "sdk_error: <msg>")
+    """
+    msg = str(exc).lower()
+    if "maximum number of turns" in msg or "max turns" in msg:
+        return "turns", "max_turns"
+    if "maximum budget" in msg or "max_budget" in msg or "max cost" in msg or "maximum cost" in msg:
+        return "budget", "max_budget"
+    return None, f"sdk_error: {exc}"
 
 SYSTEM_PROMPT = """\
 You are a job-application tracking agent. Your only job is to look at one \
@@ -133,7 +166,8 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
     Returns a dict with:
         proposal:           validated AgentProposal | None
         validation_error:   str | None (set when Pydantic rejects the SDK's output)
-        result_subtype:     str | None (SDK-level subtype, e.g. error_max_structured_output_retries)
+        result_subtype:     str | None (SDK subtype, e.g. error_max_structured_output_retries)
+        cap_hit:            str | None ("turns" | "budget" | "timeout" when a Phase 3.4 cap fired)
         raw_text:           assistant final text (mostly empty in structured mode)
         structured_output:  dict | None (what the SDK returned, pre-Pydantic)
         tool_calls:         list of {name, input}
@@ -150,7 +184,8 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
         tools=_READ_ONLY_TOOLS,
         allowed_tools=_READ_ONLY_TOOLS,
         disallowed_tools=_WRITE_TOOLS,
-        max_turns=10,
+        max_turns=MAX_TURNS,
+        max_budget_usd=MAX_BUDGET_USD,
         # Phase 3.2 guardrail: constrain the final message to the AgentProposal
         # schema. The CLI passes this to Anthropic's constrained sampling.
         output_format={"type": "json_schema", "schema": schema},
@@ -164,23 +199,41 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
     cost_usd: float | None = None
     structured_output: dict | None = None
     result_subtype: str | None = None
+    cap_hit: str | None = None
     start = time.monotonic()
 
-    async for message in query(prompt=user_message, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, ToolUseBlock):
-                    call = {"name": block.name, "input": dict(block.input)}
-                    tool_calls.append(call)
-                    if trace:
-                        print(f"[tool] {call['name']} {call['input']}", file=sys.stderr)
-                elif isinstance(block, TextBlock):
-                    text_parts.append(block.text)
-        elif isinstance(message, ResultMessage):
-            result_subtype = getattr(message, "subtype", None)
-            if result_subtype == "success":
-                cost_usd = getattr(message, "total_cost_usd", None)
-                structured_output = getattr(message, "structured_output", None)
+    async def _consume_query() -> None:
+        nonlocal cost_usd, structured_output, result_subtype
+        async for message in query(prompt=user_message, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        call = {"name": block.name, "input": dict(block.input)}
+                        tool_calls.append(call)
+                        if trace:
+                            print(f"[tool] {call['name']} {call['input']}", file=sys.stderr)
+                    elif isinstance(block, TextBlock):
+                        text_parts.append(block.text)
+            elif isinstance(message, ResultMessage):
+                result_subtype = getattr(message, "subtype", None)
+                if result_subtype == "success":
+                    cost_usd = getattr(message, "total_cost_usd", None)
+                    structured_output = getattr(message, "structured_output", None)
+
+    try:
+        # Phase 3.4 cap: wall-clock timeout. SDK doesn't expose one; we wrap
+        # the consumer externally. Cancels the in-flight query on timeout.
+        await asyncio.wait_for(_consume_query(), timeout=WALL_CLOCK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        cap_hit = "timeout"
+        result_subtype = "wall_clock_timeout"
+    except Exception as e:
+        # max_turns and max_budget_usd surface as Exceptions, not as a
+        # ResultMessage subtype. Map known cap-related messages; let
+        # anything else through as `sdk_error: ...` for visibility.
+        cap_hit, result_subtype = _classify_runtime_exception(e)
+        if trace:
+            print(f"[sdk_error] {e}", file=sys.stderr)
 
     duration_s = time.monotonic() - start
 
@@ -193,13 +246,19 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
             validation_error = str(e)
 
     if trace:
-        status = "ok" if proposal is not None else f"FAIL({result_subtype or 'validation_error'})"
+        if proposal is not None:
+            status = "ok"
+        elif cap_hit:
+            status = f"CAP_HIT({cap_hit})"
+        else:
+            status = f"FAIL({result_subtype or 'validation_error'})"
         print(f"[done] cost={cost_usd} duration={duration_s:.2f}s status={status}", file=sys.stderr)
 
     return {
         "proposal": proposal,
         "validation_error": validation_error,
         "result_subtype": result_subtype,
+        "cap_hit": cap_hit,
         "raw_text": "".join(text_parts).strip(),
         "structured_output": structured_output,
         "tool_calls": tool_calls,

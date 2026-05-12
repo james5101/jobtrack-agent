@@ -50,7 +50,7 @@ def load_dataset() -> list[dict]:
 
 # ---------- Per-row scoring ----------
 
-def evaluate_row(row: dict, proposal: AgentProposal | None) -> dict:
+def evaluate_row(row: dict, proposal: AgentProposal | None, cap_hit: str | None = None) -> dict:
     """Compare the agent's validated proposal against labeled expectations.
 
     A row passes when:
@@ -59,13 +59,18 @@ def evaluate_row(row: dict, proposal: AgentProposal | None) -> dict:
     - matched_application_id matches (or both null)
     - for update_status: action.status also matches
 
-    When the proposal is None (SDK couldn't produce schema-valid output OR
-    Pydantic rejected it), we record `schema_error` separately from `fail`.
+    Non-pass states are bucketed:
+    - `cap_hit`     — a Phase 3.4 cap fired (turns / budget / timeout). No
+                      proposal produced; the agent didn't get to finish.
+    - `schema_error` — SDK returned without schema-valid output OR Pydantic
+                      rejected it. The agent finished but couldn't comply.
+    - otherwise     — a regular fail (proposal exists, predictions wrong).
     """
     if proposal is None:
         return {
             "pass": False,
-            "schema_error": True,
+            "cap_hit": cap_hit,                 # one of "turns" | "budget" | "timeout" | None
+            "schema_error": cap_hit is None,    # only schema_error when no cap fired
             "classification_match": False,
             "tool_match": False,
             "app_id_match": False,
@@ -96,6 +101,7 @@ def evaluate_row(row: dict, proposal: AgentProposal | None) -> dict:
 
     return {
         "pass": bool(passed),
+        "cap_hit": None,
         "schema_error": False,
         "classification_match": classification_match,
         "tool_match": tool_match,
@@ -112,8 +118,15 @@ def aggregate(per_row: list[dict]) -> dict:
         return {"n_rows": 0}
 
     n_schema_err = sum(1 for r in per_row if r["evaluation"]["schema_error"])
+    n_cap_hit = sum(1 for r in per_row if r["evaluation"]["cap_hit"])
     n_pass = sum(1 for r in per_row if r["evaluation"]["pass"])
-    n_fail = n - n_pass - n_schema_err
+    n_fail = n - n_pass - n_schema_err - n_cap_hit
+
+    cap_kinds: dict[str, int] = defaultdict(int)
+    for r in per_row:
+        kind = r["evaluation"]["cap_hit"]
+        if kind:
+            cap_kinds[kind] += 1
 
     class_confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     action_confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -147,10 +160,12 @@ def aggregate(per_row: list[dict]) -> dict:
         "n_pass": n_pass,
         "n_fail": n_fail,
         "n_schema_error": n_schema_err,
+        "n_cap_hit": n_cap_hit,
         "pass_rate": n_pass / n,
         "classification_confusion": {k: dict(v) for k, v in class_confusion.items()},
         "action_confusion": {k: dict(v) for k, v in action_confusion.items()},
         "gate_decisions": dict(gate_counts),
+        "cap_hits": dict(cap_kinds),
         "mean_tool_calls": round(mean_tool_calls, 2),
         "mean_cost_usd": round(mean_cost, 4),
         "mean_duration_s": round(mean_duration, 2),
@@ -164,7 +179,7 @@ async def run_row(row: dict) -> dict:
     print(f"\n=== {row['id']} ===", file=sys.stderr)
     result = await run_agent(row["email_body"])
     proposal_obj: AgentProposal | None = result["proposal"]
-    evaluation = evaluate_row(row, proposal_obj)
+    evaluation = evaluate_row(row, proposal_obj, cap_hit=result.get("cap_hit"))
 
     # Phase 3.3: compute the gate decision WITHOUT executing the writer.
     # Eval runs must never mutate jobtrack state — the decision is a report.
@@ -183,6 +198,7 @@ async def run_row(row: dict) -> dict:
         "gate_decision": gate_decision.value if gate_decision else None,
         "validation_error": result["validation_error"],
         "result_subtype": result["result_subtype"],
+        "cap_hit": result.get("cap_hit"),
         "raw_structured_output": result["structured_output"],
         "tool_calls": result["tool_calls"],
         "cost_usd": result["cost_usd"],
@@ -224,6 +240,7 @@ def print_scorecard(score: dict, results: list[dict]) -> None:
     print(f"Passed:       {score['n_pass']} ({score['pass_rate']:.0%})")
     print(f"Failed:       {score['n_fail']}")
     print(f"Schema error: {score['n_schema_error']}")
+    print(f"Cap hits:     {score['n_cap_hit']} {dict(score['cap_hits']) if score['cap_hits'] else ''}")
     print()
     print(f"Mean tool calls/row: {score['mean_tool_calls']}")
     print(f"Mean cost/row:       ${score['mean_cost_usd']}")
@@ -233,7 +250,14 @@ def print_scorecard(score: dict, results: list[dict]) -> None:
     print("Per-row:")
     for r in results:
         e = r["evaluation"]
-        flag = "PASS" if e["pass"] else ("SCHEMA_ERR" if e["schema_error"] else "FAIL")
+        if e["pass"]:
+            flag = "PASS"
+        elif e["cap_hit"]:
+            flag = f"CAP({e['cap_hit'][:3].upper()})"
+        elif e["schema_error"]:
+            flag = "SCHEMA_ERR"
+        else:
+            flag = "FAIL"
         conf = (r["proposal"] or {}).get("confidence")
         conf_str = f"conf={conf:.2f}" if isinstance(conf, (int, float)) else "conf=  - "
         gate = (r.get("gate_decision") or "-").upper()[:5]
