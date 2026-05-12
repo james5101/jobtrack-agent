@@ -31,6 +31,12 @@ evals/results/*.rows.jsonl
 # including real recruiter / application identifiers. Stay local.
 pending_actions/
 
+# Phase 3.5 audit log. Email *bodies* are hashed, but the proposal's
+# reasoning text may still name real people / companies. Local-only;
+# Phase 4 will tee this to a hosted aggregator with whatever redaction
+# that destination requires.
+audit/
+
 # Editor / OS detritus.
 .vscode/
 .idea/

@@ -47,11 +47,12 @@ from claude_agent_sdk import (
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
+from .audit import build_entry, write_audit
 from .gating import GateDecision, gate_proposal
 from .mcp_client import JOBTRACK_SERVER_NAME, jobtrack_mcp_config
 from .models import AgentProposal
 from .sanitize import sanitize_email
-from .writer import execute_proposal
+from .writer import _email_hash, execute_proposal
 
 _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__list_applications",
@@ -267,30 +268,52 @@ async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
     }
 
 
-async def triage(email_text: str, *, execute: bool = True) -> dict[str, Any]:
-    """Full pipeline: agent → gate → (optionally) execute.
+async def triage(
+    email_text: str,
+    *,
+    execute: bool = True,
+    trigger: str = "cli",
+) -> dict[str, Any]:
+    """Full pipeline: agent → gate → (optionally) execute → audit.
 
     `execute=False` is the eval-safe path: the gate decision is computed
     but the writer is not invoked. `execute=True` is production behavior:
     high-confidence proposals get applied via direct MCP, medium ones get
     queued, low ones drop.
+
+    Every triage emits one audit row regardless of outcome. The audit log
+    is the durable record of what the system did; even a cap-hit or
+    schema-error run is recorded so an operator can find it later.
+
+    `trigger` labels the invocation source ("cli", "cli-dry-run",
+    "webhook"). Audit consumers filter on it.
     """
     result = await run_agent(email_text)
     proposal = result["proposal"]
-    if proposal is None:
-        return {**result, "decision": None, "execution": None}
 
-    decision = gate_proposal(proposal)
-    print(f"[gate] decision={decision.value} confidence={proposal.confidence:.2f}",
-          file=sys.stderr)
-
+    decision: GateDecision | None = None
     execution: dict[str, Any] | None = None
-    if execute:
-        execution = await execute_proposal(proposal, decision, email_body=email_text)
-        print(f"[execute] {execution.get('decision')} executed={execution.get('executed')}",
-              file=sys.stderr)
 
-    return {**result, "decision": decision, "execution": execution}
+    if proposal is not None:
+        decision = gate_proposal(proposal)
+        print(f"[gate] decision={decision.value} confidence={proposal.confidence:.2f}",
+              file=sys.stderr)
+        if execute:
+            execution = await execute_proposal(proposal, decision, email_body=email_text)
+            print(f"[execute] {execution.get('decision')} executed={execution.get('executed')}",
+                  file=sys.stderr)
+
+    triage_result = {**result, "decision": decision, "execution": execution}
+
+    audit_path = write_audit(build_entry(
+        trigger=trigger,
+        email_hash=_email_hash(email_text) or "sha256:none",
+        model=MODEL,
+        triage_result=triage_result,
+    ))
+    print(f"[audit] {audit_path.name}", file=sys.stderr)
+
+    return triage_result
 
 
 def main() -> None:
@@ -318,7 +341,8 @@ def main() -> None:
         print("error: no email provided on stdin or argv[1]", file=sys.stderr)
         sys.exit(2)
 
-    result = asyncio.run(triage(email_text, execute=execute))
+    trigger = "cli-dry-run" if not execute else "cli"
+    result = asyncio.run(triage(email_text, execute=execute, trigger=trigger))
 
     if result["proposal"] is not None:
         payload = {
