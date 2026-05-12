@@ -19,6 +19,14 @@ build/
 # (without `-real` in the filename) are fair game to commit.
 samples/emails/*-real.eml
 
+# Same rule for the eval dataset: real rows stay local.
+evals/dataset-real.jsonl
+
+# Per-row eval results carry the agent's raw text output (recruiter names,
+# reasoning over real email content). Only the aggregate scorecard `.json`
+# files in evals/results/ commit. The `.rows.jsonl` companions stay local.
+evals/results/*.rows.jsonl
+
 # Editor / OS detritus.
 .vscode/
 .idea/

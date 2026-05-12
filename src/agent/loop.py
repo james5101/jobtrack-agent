@@ -6,18 +6,23 @@ that talks to jobtrack via MCP, and prints a proposed action as JSON.
 The tool-call trace and run metadata go to stderr so the JSON on stdout can be
 piped cleanly:
 
-    python -m agent.loop < samples/emails/interview-01.eml > proposal.json
+    python -m agent.loop samples/emails/interview-01.eml > proposal.json
 
-Phase 1 is read-only by construction: the agent's allowed_tools whitelist
-contains only the four jobtrack read tools. Write tools (update_status,
-add_note, edit_tags) are not callable from this loop. Phase 3 lifts that
-restriction behind a confidence gate and audit log.
+Phase 1 is read-only by construction: the agent's tool surface is restricted
+to the four jobtrack read tools. Write tools (update_status, add_note,
+edit_tags) are not callable from this loop. Phase 3 lifts that restriction
+behind a confidence gate and audit log.
+
+The eval harness (`evals/run.py`) imports `run_agent` directly to reuse the
+exact same configuration the CLI uses.
 """
 from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -37,6 +42,8 @@ _READ_ONLY_TOOLS = [
     f"mcp__{JOBTRACK_SERVER_NAME}__search_applications",
     f"mcp__{JOBTRACK_SERVER_NAME}__get_recent",
 ]
+
+MODEL = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """\
 You are a job-application tracking agent. Your only job is to look at one \
@@ -86,9 +93,21 @@ Reply with exactly one JSON object and nothing else — no prose before or after
 """
 
 
-async def _run(email_text: str) -> str:
+async def run_agent(email_text: str, *, trace: bool = True) -> dict[str, Any]:
+    """Run one email through the agent and return a structured result.
+
+    Returns a dict with:
+        text:        final assistant text (the JSON proposal, possibly with
+                     surrounding prose — parsing is the caller's job).
+        tool_calls:  list of {name, input} dicts in the order they were made.
+        cost_usd:    total cost reported by the SDK, or None.
+        duration_s:  wall-clock seconds.
+
+    When trace=True, tool calls are also echoed to stderr live, mirroring the
+    CLI experience. Eval runs can leave this on for debugging.
+    """
     options = ClaudeAgentOptions(
-        model="claude-sonnet-4-6",
+        model=MODEL,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={JOBTRACK_SERVER_NAME: jobtrack_mcp_config()},
         # `tools` defines the universe of tools the model can see — without it
@@ -102,22 +121,35 @@ async def _run(email_text: str) -> str:
     )
 
     user_message = f"<inbound_email>\n{email_text}\n</inbound_email>"
-    final_text_parts: list[str] = []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    cost_usd: float | None = None
+    start = time.monotonic()
 
     async for message in query(prompt=user_message, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
-                    print(f"[tool] {block.name} {block.input}", file=sys.stderr)
+                    call = {"name": block.name, "input": dict(block.input)}
+                    tool_calls.append(call)
+                    if trace:
+                        print(f"[tool] {call['name']} {call['input']}", file=sys.stderr)
                 elif isinstance(block, TextBlock):
-                    final_text_parts.append(block.text)
+                    text_parts.append(block.text)
         elif isinstance(message, ResultMessage):
             if getattr(message, "subtype", None) == "success":
-                cost = getattr(message, "total_cost_usd", None)
-                usage = getattr(message, "usage", None)
-                print(f"[done] cost={cost} usage={usage}", file=sys.stderr)
+                cost_usd = getattr(message, "total_cost_usd", None)
 
-    return "".join(final_text_parts).strip()
+    duration_s = time.monotonic() - start
+    if trace:
+        print(f"[done] cost={cost_usd} duration={duration_s:.2f}s", file=sys.stderr)
+
+    return {
+        "text": "".join(text_parts).strip(),
+        "tool_calls": tool_calls,
+        "cost_usd": cost_usd,
+        "duration_s": duration_s,
+    }
 
 
 def main() -> None:
@@ -137,8 +169,8 @@ def main() -> None:
         print("error: no email provided on stdin or argv[1]", file=sys.stderr)
         sys.exit(2)
 
-    result = asyncio.run(_run(email_text))
-    print(result)
+    result = asyncio.run(run_agent(email_text))
+    print(result["text"])
 
 
 if __name__ == "__main__":
