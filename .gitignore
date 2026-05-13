@@ -15,6 +15,11 @@ build/
 # Claude Code: personal/local overrides only. settings.json (shared) is fine to commit.
 .claude/settings.local.json
 
+# CLAUDE.md is the project-targeted Claude guidance — working agreements,
+# phase discipline, lessons-learned. Local-only. The public README has
+# the factual project shape.
+CLAUDE.md
+
 # Real, unsanitized email samples live locally only. Sanitized versions
 # (without `-real` in the filename) are fair game to commit.
 samples/emails/*-real.eml
